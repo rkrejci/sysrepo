@@ -402,6 +402,16 @@ sr_disconnect(sr_conn_ctx_t *conn)
         }
     }
 
+    /* stop all the sessions */
+    while (conn->session_count) {
+        tmp_err = _sr_session_stop(conn->sessions[0]);
+        sr_errinfo_merge(&err_info, tmp_err);
+    }
+
+    /* free any stored operational data (this connection must still be in the recovery state) */
+    tmp_err = sr_shmmod_oper_stored_del_conn(conn, conn->sr_cid);
+    sr_errinfo_merge(&err_info, tmp_err);
+
     /* remove from state */
     sr_shmmain_conn_del((sr_main_shm_t *)conn->main_shm.addr, conn->ext_shm.addr, conn->sr_cid);
 
@@ -409,16 +419,6 @@ sr_disconnect(sr_conn_ctx_t *conn)
         /* SHM UNLOCK */
         sr_shmmain_unlock(conn, SR_LOCK_WRITE, 1, __func__);
     }
-
-    /* stop all the sessions */
-    while (conn->session_count) {
-        tmp_err = _sr_session_stop(conn->sessions[0]);
-        sr_errinfo_merge(&err_info, tmp_err);
-    }
-
-    /* free any stored operational data */
-    tmp_err = sr_shmmod_oper_stored_del_conn(conn, conn->sr_cid);
-    sr_errinfo_merge(&err_info, tmp_err);
 
     /* free attributes */
     sr_conn_free(conn);
@@ -1657,7 +1657,7 @@ sr_get_item(sr_session_ctx_t *session, const char *path, uint32_t timeout_ms, sr
 
 cleanup_mods_unlock:
     /* MODULES UNLOCK */
-    sr_shmmod_modinfo_unlock(&mod_info, 0);
+    sr_shmmod_modinfo_unlock(&mod_info, session->sid);
 
 cleanup_shm_unlock:
     /* SHM UNLOCK */
@@ -1726,7 +1726,7 @@ sr_get_items(sr_session_ctx_t *session, const char *xpath, uint32_t timeout_ms, 
 
 cleanup_mods_unlock:
     /* MODULES UNLOCK */
-    sr_shmmod_modinfo_unlock(&mod_info, 0);
+    sr_shmmod_modinfo_unlock(&mod_info, session->sid);
 
 cleanup_shm_unlock:
     /* SHM UNLOCK */
@@ -1798,7 +1798,7 @@ sr_get_subtree(sr_session_ctx_t *session, const char *path, uint32_t timeout_ms,
 
 cleanup_mods_unlock:
     /* MODULES UNLOCK */
-    sr_shmmod_modinfo_unlock(&mod_info, 0);
+    sr_shmmod_modinfo_unlock(&mod_info, session->sid);
 
 cleanup_shm_unlock:
     /* SHM UNLOCK */
@@ -1893,7 +1893,7 @@ sr_get_data(sr_session_ctx_t *session, const char *xpath, uint32_t max_depth, ui
 
 cleanup_mods_unlock:
     /* MODULES UNLOCK */
-    sr_shmmod_modinfo_unlock(&mod_info, 0);
+    sr_shmmod_modinfo_unlock(&mod_info, session->sid);
 
 cleanup_shm_unlock:
     /* SHM UNLOCK */
@@ -2204,7 +2204,7 @@ sr_validate(sr_session_ctx_t *session, const char *module_name, uint32_t timeout
 
 cleanup_mods_unlock:
     /* MODULES UNLOCK */
-    sr_shmmod_modinfo_unlock(&mod_info, 0);
+    sr_shmmod_modinfo_unlock(&mod_info, session->sid);
 
 cleanup_shm_unlock:
     /* SHM UNLOCK */
@@ -2473,7 +2473,7 @@ sr_apply_changes(sr_session_ctx_t *session, uint32_t timeout_ms, int wait)
 
 cleanup_mods_unlock:
     /* MODULES UNLOCK */
-    sr_shmmod_modinfo_unlock(&mod_info, 1);
+    sr_shmmod_modinfo_unlock(&mod_info, session->sid);
 
 cleanup_shm_unlock:
     /* SHM UNLOCK */
@@ -2564,7 +2564,7 @@ _sr_replace_config(sr_session_ctx_t *session, const struct lys_module *ly_mod, s
 
 cleanup_mods_unlock:
     /* MODULES UNLOCK */
-    sr_shmmod_modinfo_unlock(&mod_info, 1);
+    sr_shmmod_modinfo_unlock(&mod_info, session->sid);
 
     ly_set_clean(&mod_set);
     sr_modinfo_free(&mod_info);
@@ -2685,7 +2685,7 @@ sr_copy_config(sr_session_ctx_t *session, const char *module_name, sr_datastore_
     }
 
     /* MODULES UNLOCK */
-    sr_shmmod_modinfo_unlock(&mod_info, 0);
+    sr_shmmod_modinfo_unlock(&mod_info, session->sid);
 
     /* replace the data */
     if ((err_info = _sr_replace_config(session, ly_mod, &mod_info.data, timeout_ms, wait))) {
@@ -2708,7 +2708,7 @@ sr_copy_config(sr_session_ctx_t *session, const char *module_name, sr_datastore_
 
 cleanup_modules_unlock:
     /* MODULES UNLOCK */
-    sr_shmmod_modinfo_unlock(&mod_info, 0);
+    sr_shmmod_modinfo_unlock(&mod_info, session->sid);
 
 cleanup_shm_unlock:
     /* SHM UNLOCK */
@@ -2744,7 +2744,7 @@ sr_change_dslock(struct sr_mod_info_s *mod_info, int lock, sr_sid_t sid)
         assert(mod->state & MOD_INFO_REQ);
 
         /* we assume these modules are write-locked by this session */
-        assert(shm_lock->write_locked && (shm_lock->sid.sr == sid.sr));
+        assert(shm_lock->sid.sr == sid.sr);
 
         /* it was successfully WRITE-locked, check that DS lock state is as expected */
         if (shm_lock->ds_locked && lock) {
@@ -2862,7 +2862,7 @@ _sr_un_lock(sr_session_ctx_t *session, const char *module_name, int lock)
 
 cleanup_mods_unlock:
     /* MODULES UNLOCK */
-    sr_shmmod_modinfo_unlock(&mod_info, 1);
+    sr_shmmod_modinfo_unlock(&mod_info, session->sid);
 
 cleanup:
     ly_set_clean(&mod_set);
@@ -3261,7 +3261,7 @@ sr_module_change_subscribe_running_enable(sr_session_ctx_t *session, const struc
     }
 
     /* MODULES UNLOCK */
-    sr_shmmod_modinfo_unlock(&mod_info, 0);
+    sr_shmmod_modinfo_unlock(&mod_info, session->sid);
 
     ly_set_clean(&mod_set);
     sr_modinfo_free(&mod_info);
@@ -3311,7 +3311,7 @@ cleanup:
 
 error_mods_unlock:
     /* MODULES UNLOCK */
-    sr_shmmod_modinfo_unlock(&mod_info, 0);
+    sr_shmmod_modinfo_unlock(&mod_info, session->sid);
 
     ly_set_clean(&mod_set);
     sr_modinfo_free(&mod_info);
@@ -4353,7 +4353,7 @@ sr_rpc_send_tree(sr_session_ctx_t *session, struct lyd_node *input, uint32_t tim
     }
 
     /* MODULES UNLOCK */
-    sr_shmmod_modinfo_unlock(&mod_info, 0);
+    sr_shmmod_modinfo_unlock(&mod_info, session->sid);
 
     ly_set_clean(&mod_set);
     sr_modinfo_free(&mod_info);
@@ -4405,7 +4405,7 @@ sr_rpc_send_tree(sr_session_ctx_t *session, struct lyd_node *input, uint32_t tim
 
 cleanup_mods_unlock:
     /* MODULES UNLOCK */
-    sr_shmmod_modinfo_unlock(&mod_info, 0);
+    sr_shmmod_modinfo_unlock(&mod_info, session->sid);
 
 cleanup_shm_unlock:
     /* SHM UNLOCK */
@@ -4740,7 +4740,7 @@ sr_event_notif_send_tree(sr_session_ctx_t *session, struct lyd_node *notif)
     }
 
     /* MODULES UNLOCK */
-    sr_shmmod_modinfo_unlock(&mod_info, 0);
+    sr_shmmod_modinfo_unlock(&mod_info, session->sid);
 
     /* store the notification for a replay, we continue on failure */
     err_info = sr_replay_store(session, notif, notif_ts);
@@ -4764,7 +4764,7 @@ sr_event_notif_send_tree(sr_session_ctx_t *session, struct lyd_node *notif)
 
 cleanup_mods_unlock:
     /* MODULES UNLOCK */
-    sr_shmmod_modinfo_unlock(&mod_info, 0);
+    sr_shmmod_modinfo_unlock(&mod_info, session->sid);
 
 cleanup_shm_unlock:
     /* SHM UNLOCK */
