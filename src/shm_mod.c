@@ -273,19 +273,9 @@ sr_shmmod_collect_instid_deps_modinfo(const struct sr_mod_info_s *mod_info, stru
     return NULL;
 }
 
-/**
- * @brief Lock or relock a main SHM module.
- *
- * @param[in] mod_name Module name.
- * @param[in] shm_lock Main SHM module lock.
- * @param[in] timeout_ms Timeout in ms.
- * @param[in] mode Lock mode of the module.
- * @param[in] sid Sysrepo session ID to store.
- * @param[in] relock Whether some lock is already held or not.
- */
-static sr_error_info_t *
-sr_shmmod_lock(const char *mod_name, struct sr_mod_lock_s *shm_lock, int timeout_ms, sr_lock_mode_t mode, sr_sid_t sid,
-        int relock)
+sr_error_info_t *
+sr_shmmod_lock(const char *mod_name, struct sr_mod_lock_s *shm_lock, int timeout_ms, sr_lock_mode_t mode, sr_cid_t cid,
+        sr_sid_t sid, int relock)
 {
     sr_error_info_t *err_info = NULL, *tmp_err;
 
@@ -293,10 +283,10 @@ sr_shmmod_lock(const char *mod_name, struct sr_mod_lock_s *shm_lock, int timeout
         assert(!memcmp(&shm_lock->sid, &sid, sizeof sid));
 
         /* RELOCK */
-        err_info = sr_rwrelock(&shm_lock->lock, timeout_ms, mode, __func__);
+        err_info = sr_rwrelock(&shm_lock->lock, timeout_ms, mode, cid, __func__, NULL, NULL);
     } else {
         /* LOCK */
-        err_info = sr_rwlock(&shm_lock->lock, timeout_ms, mode, __func__, NULL);
+        err_info = sr_rwlock(&shm_lock->lock, timeout_ms, mode, cid, __func__, NULL, NULL);
     }
     if (err_info) {
         if (err_info->err_code == SR_ERR_TIME_OUT) {
@@ -335,33 +325,26 @@ revert_lock:
         /* RELOCK */
         if ((mode == SR_LOCK_READ) || (mode == SR_LOCK_READ_UPGR)) {
             /* is downgraded, upgrade */
-            tmp_err = sr_rwrelock(&shm_lock->lock, timeout_ms, SR_LOCK_WRITE, __func__);
+            tmp_err = sr_rwrelock(&shm_lock->lock, timeout_ms, SR_LOCK_WRITE, cid, __func__, NULL, NULL);
         } else {
             /* is upgraded, downgrade */
-            tmp_err = sr_rwrelock(&shm_lock->lock, timeout_ms, SR_LOCK_READ_UPGR, __func__);
+            tmp_err = sr_rwrelock(&shm_lock->lock, timeout_ms, SR_LOCK_READ_UPGR, cid, __func__, NULL, NULL);
         }
         if (tmp_err) {
             sr_errinfo_merge(&err_info, tmp_err);
         }
     } else {
         /* UNLOCK */
-        sr_rwunlock(&shm_lock->lock, mode, __func__);
+        sr_rwunlock(&shm_lock->lock, timeout_ms, mode, cid, __func__);
     }
     return err_info;
 }
 
-/**
- * @brief Unlock a main SHM module.
- *
- * @param[in] shm_lock Main SHM module lock.
- * @param[in] mode Lock mode of the module.
- * @param[in] sid Sysrepo session ID of the lock owner.
- */
-static void
-sr_shmmod_unlock(struct sr_mod_lock_s *shm_lock, sr_lock_mode_t mode, sr_sid_t sid)
+void
+sr_shmmod_unlock(struct sr_mod_lock_s *shm_lock, int timeout_ms, sr_lock_mode_t mode, sr_cid_t cid, sr_sid_t sid)
 {
     /* UNLOCK */
-    sr_rwunlock(&shm_lock->lock, mode, __func__);
+    sr_rwunlock(&shm_lock->lock, timeout_ms, mode, cid, __func__);
 
     /* remove our SID */
     if ((mode == SR_LOCK_READ_UPGR) || (mode == SR_LOCK_WRITE)) {
@@ -378,39 +361,6 @@ sr_shmmod_unlock(struct sr_mod_lock_s *shm_lock, sr_lock_mode_t mode, sr_sid_t s
             memset(&shm_lock->sid, 0, sizeof shm_lock->sid);
         }
     }
-}
-
-/**
- * @brief Update information about held module locks in SHM for the connection state.
- *
- * @param[in] conn Connection and its state to update.
- * @param[in] shm_mod SHM module.
- * @param[in] ds Datastore.
- * @param[in] mode Held lock mode.
- * @param[in] lock Whether the lock was locked or unlocked.
- */
-static void
-sr_shmmod_conn_lock_update(sr_conn_ctx_t *conn, sr_mod_t *shm_mod, sr_datastore_t ds, sr_lock_mode_t mode, int lock)
-{
-    sr_error_info_t *err_info = NULL;
-    uint32_t shm_mod_idx;
-    sr_conn_shm_lock_t (*mod_locks)[SR_DS_COUNT];
-    sr_conn_shm_t *conn_s;
-
-    assert(mode);
-
-    conn_s = sr_shmmain_conn_find(conn->main_shm.addr, conn->ext_shm.addr, conn);
-    if (!conn_s) {
-        SR_ERRINFO_INT(&err_info);
-        goto cleanup;
-    }
-
-    mod_locks = (sr_conn_shm_lock_t (*)[SR_DS_COUNT])(conn->ext_shm.addr + conn_s->mod_locks);
-    shm_mod_idx = SR_SHM_MOD_IDX(shm_mod, conn->main_shm);
-    sr_shmlock_update(conn->main_shm.addr, &mod_locks[shm_mod_idx][ds], mode, lock);
-
-cleanup:
-    sr_errinfo_free(&err_info);
 }
 
 static sr_error_info_t *
@@ -437,12 +387,10 @@ sr_shmmod_modinfo_lock(struct sr_mod_info_s *mod_info, sr_datastore_t ds, uint32
         }
 
         /* MOD LOCK */
-        if ((err_info = sr_shmmod_lock(mod->ly_mod->name, shm_lock, SR_MOD_LOCK_TIMEOUT * 1000, mode, sid, 0))) {
+        if ((err_info = sr_shmmod_lock(mod->ly_mod->name, shm_lock, SR_MOD_LOCK_TIMEOUT * 1000, mode,
+                mod_info->conn->cid, sid, 0))) {
             return err_info;
         }
-
-        /* remember this lock in SHM */
-        sr_shmmod_conn_lock_update(mod_info->conn, mod->shm_mod, ds, mode, 1);
 
         /* set the flag for unlocking */
         mod->state |= lock_bit;
@@ -518,13 +466,10 @@ sr_shmmod_modinfo_rdlock_upgrade(struct sr_mod_info_s *mod_info, sr_sid_t sid)
         /* upgrade only read-upgr-locked modules */
         if (mod->state & MOD_INFO_RLOCK_UPGR) {
             /* MOD WRITE UPGRADE */
-            if ((err_info = sr_shmmod_lock(mod->ly_mod->name, shm_lock, SR_MOD_LOCK_TIMEOUT * 1000, SR_LOCK_WRITE, sid, 1))) {
+            if ((err_info = sr_shmmod_lock(mod->ly_mod->name, shm_lock, SR_MOD_LOCK_TIMEOUT * 1000, SR_LOCK_WRITE,
+                    mod_info->conn->cid, sid, 1))) {
                 return err_info;
             }
-
-            /* update this lock in SHM */
-            sr_shmmod_conn_lock_update(mod_info->conn, mod->shm_mod, mod_info->ds, SR_LOCK_READ_UPGR, 0);
-            sr_shmmod_conn_lock_update(mod_info->conn, mod->shm_mod, mod_info->ds, SR_LOCK_WRITE, 1);
 
             /* update the flag for unlocking */
             mod->state &= ~MOD_INFO_RLOCK_UPGR;
@@ -550,13 +495,10 @@ sr_shmmod_modinfo_wrlock_downgrade(struct sr_mod_info_s *mod_info, sr_sid_t sid)
         /* downgrade only write-locked modules */
         if (mod->state & MOD_INFO_WLOCK) {
             /* MOD READ DOWNGRADE */
-            if ((err_info = sr_shmmod_lock(mod->ly_mod->name, shm_lock, SR_MOD_LOCK_TIMEOUT * 1000, SR_LOCK_READ_UPGR, sid, 1))) {
+            if ((err_info = sr_shmmod_lock(mod->ly_mod->name, shm_lock, SR_MOD_LOCK_TIMEOUT * 1000, SR_LOCK_READ_UPGR,
+                    mod_info->conn->cid, sid, 1))) {
                 return err_info;
             }
-
-            /* update this lock in SHM */
-            sr_shmmod_conn_lock_update(mod_info->conn, mod->shm_mod, mod_info->ds, SR_LOCK_WRITE, 0);
-            sr_shmmod_conn_lock_update(mod_info->conn, mod->shm_mod, mod_info->ds, SR_LOCK_READ_UPGR, 1);
 
             /* update the flag for unlocking */
             mod->state &= ~MOD_INFO_WLOCK;
@@ -592,10 +534,7 @@ sr_shmmod_modinfo_unlock(struct sr_mod_info_s *mod_info, sr_sid_t sid)
             }
 
             /* MOD UNLOCK */
-            sr_shmmod_unlock(shm_lock, mode, sid);
-
-            /* remove this lock in SHM */
-            sr_shmmod_conn_lock_update(mod_info->conn, mod->shm_mod, mod_info->ds, mode, 0);
+            sr_shmmod_unlock(shm_lock, SR_MOD_LOCK_TIMEOUT * 1000, mode, mod_info->conn->cid, sid);
         }
 
         if (mod->state & MOD_INFO_RLOCK2) {
@@ -603,10 +542,7 @@ sr_shmmod_modinfo_unlock(struct sr_mod_info_s *mod_info, sr_sid_t sid)
             shm_lock = &mod->shm_mod->data_lock_info[mod_info->ds2];
 
             /* MOD READ UNLOCK */
-            sr_shmmod_unlock(shm_lock, SR_LOCK_READ, sid);
-
-            /* update this lock in SHM */
-            sr_shmmod_conn_lock_update(mod_info->conn, mod->shm_mod, mod_info->ds2, SR_LOCK_READ, 0);
+            sr_shmmod_unlock(shm_lock, SR_MOD_LOCK_TIMEOUT * 1000, SR_LOCK_READ, mod_info->conn->cid, sid);
         }
 
         /* clear all flags */
@@ -715,6 +651,7 @@ sr_shmmod_change_subscription_add(sr_conn_ctx_t *conn, sr_mod_t *shm_mod, const 
     shm_sub->priority = priority;
     shm_sub->opts = sub_opts;
     shm_sub->evpipe_num = evpipe_num;
+    shm_sub->cid = conn->cid;
 
     /* SHM LOCK DOWNGRADE */
     if ((err_info = sr_shmmain_relock(conn, SR_LOCK_READ_UPGR, __func__))) {
@@ -884,6 +821,7 @@ sr_shmmod_oper_subscription_add(sr_conn_ctx_t *conn, sr_mod_t *shm_mod, const ch
     shm_sub->sub_type = sub_type;
     shm_sub->opts = sub_opts;
     shm_sub->evpipe_num = evpipe_num;
+    shm_sub->cid = conn->cid;
 
 cleanup:
     /* SHM LOCK DOWNGRADE */
@@ -989,6 +927,7 @@ sr_shmmod_notif_subscription_add(sr_conn_ctx_t *conn, sr_mod_t *shm_mod, uint32_
     /* fill new subscription */
     shm_sub->sub_id = sub_id;
     shm_sub->evpipe_num = evpipe_num;
+    shm_sub->cid = conn->cid;
 
 cleanup:
     /* SHM LOCK DOWNGRADE */

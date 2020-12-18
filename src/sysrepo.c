@@ -134,7 +134,6 @@ sr_conn_free(sr_conn_ctx_t *conn)
  * LYDMODS lock is expected to be held.
  *
  * @param[in,out] ly_ctx libyang context to use, may be destroyed and created anew.
- * @param[in] main_shm_addr Main SHM address.
  * @param[in] apply_sched Whether we can attempt to apply scheduled changes.
  * @param[in] err_on_sched_fail Whether to return an error if applying scheduled changes fails.
  * @param[out] sr_mods Parsed lydmods data.
@@ -142,12 +141,12 @@ sr_conn_free(sr_conn_ctx_t *conn)
  * @return err_info, NULL on success.
  */
 static sr_error_info_t *
-sr_conn_lydmods_ctx_update(struct ly_ctx **ly_ctx, char *main_shm_addr, int apply_sched, int err_on_sched_fail,
-        struct lyd_node **sr_mods, int *changed)
+sr_conn_lydmods_ctx_update(struct ly_ctx **ly_ctx, int apply_sched, int err_on_sched_fail, struct lyd_node **sr_mods,
+        int *changed)
 {
     sr_error_info_t *err_info = NULL;
-    sr_main_shm_t *main_shm = (sr_main_shm_t *)main_shm_addr;
     int chng, exists, fail, ctx_updated = 0;
+    uint32_t conn_count;
 
     *sr_mods = NULL;
     chng = 0;
@@ -169,7 +168,10 @@ sr_conn_lydmods_ctx_update(struct ly_ctx **ly_ctx, char *main_shm_addr, int appl
         }
         if (apply_sched) {
             /* apply scheduled changes if we can */
-            if (!main_shm->conn_count) {
+            if ((err_info = sr_conn_info(NULL, NULL, &conn_count))) {
+                goto cleanup;
+            }
+            if (!conn_count) {
                 if ((err_info = sr_lydmods_sched_apply(*sr_mods, *ly_ctx, &chng, &fail))) {
                     goto cleanup;
                 }
@@ -233,7 +235,6 @@ sr_connect(const sr_conn_options_t opts, sr_conn_ctx_t **conn_p)
     struct lyd_node *sr_mods = NULL;
     int created = 0, changed;
     sr_main_shm_t *main_shm;
-    uint32_t conn_count;
 
     SR_CHECK_ARG_APIRET(!conn_p, NULL, err_info);
 
@@ -264,14 +265,17 @@ sr_connect(const sr_conn_options_t opts, sr_conn_ctx_t **conn_p)
 
     main_shm = (sr_main_shm_t *)conn->main_shm.addr;
 
+    /* allocate next unique Connection ID */
+    conn->cid = ATOMIC_INC_RELAXED(main_shm->new_sr_cid);
+
     /* LYDMODS LOCK */
     if ((err_info = sr_mlock(&main_shm->lydmods_lock, SR_MAIN_LOCK_TIMEOUT * 1000, __func__))) {
         goto cleanup_unlock;
     }
 
     /* update connection context based on stored lydmods data */
-    err_info = sr_conn_lydmods_ctx_update(&conn->ly_ctx, conn->main_shm.addr,
-            created || !(opts & SR_CONN_NO_SCHED_CHANGES), opts & SR_CONN_ERR_ON_SCHED_FAIL, &sr_mods, &changed);
+    err_info = sr_conn_lydmods_ctx_update(&conn->ly_ctx, created || !(opts & SR_CONN_NO_SCHED_CHANGES),
+            opts & SR_CONN_ERR_ON_SCHED_FAIL, &sr_mods, &changed);
 
     /* LYDMODS UNLOCK */
     sr_munlock(&main_shm->lydmods_lock);
@@ -311,37 +315,10 @@ sr_connect(const sr_conn_options_t opts, sr_conn_ctx_t **conn_p)
         }
     }
 
-    /* remember connection count */
-    main_shm = (sr_main_shm_t *)conn->main_shm.addr;
-    conn_count = main_shm->conn_count;
-
-    /* CREATE UNLOCK */
-    sr_shmmain_createunlock(conn->main_create_lock);
-
-    /* SHM LOCK (writing into connections) */
-    if ((err_info = sr_shmmain_lock_remap(conn, SR_LOCK_WRITE, 1, __func__))) {
-        goto cleanup;
+    /* track our connections */
+    if ((err_info = sr_shmmain_conn_list_add(conn->cid))) {
+        goto cleanup_unlock;
     }
-
-    if (conn_count && !(opts & SR_CONN_NO_SCHED_CHANGES) && !main_shm->conn_count) {
-        /* all the connections were stale so we actually can apply scheduled changes, recreate the whole connection */
-
-        /* SHM UNLOCK */
-        sr_shmmain_unlock(conn, SR_LOCK_WRITE, 1, __func__);
-
-        assert(!err_info);
-        lyd_free_withsiblings(sr_mods);
-        sr_conn_free(conn);
-        return sr_connect(opts, conn_p);
-    }
-
-    /* add connection into main SHM */
-    err_info = sr_shmmain_conn_add(conn);
-
-    /* SHM UNLOCK */
-    sr_shmmain_unlock(conn, SR_LOCK_WRITE, 1, __func__);
-
-    goto cleanup;
 
 cleanup_unlock:
     /* CREATE UNLOCK */
@@ -391,7 +368,7 @@ sr_disconnect(sr_conn_ctx_t *conn)
         sr_errinfo_merge(&err_info, tmp_err);
     }
 
-    /* SHM LOCK (maybe unsubscribing, always writing into connections) */
+    /* SHM LOCK (maybe unsubscribing) */
     if ((tmp_err = sr_shmmain_lock_remap(conn, SR_LOCK_READ_UPGR, 1, __func__))) {
         sr_errinfo_merge(&err_info, tmp_err);
     } else {
@@ -412,26 +389,18 @@ sr_disconnect(sr_conn_ctx_t *conn)
         sr_errinfo_merge(&err_info, tmp_err);
     }
 
-    /* free any stored operational data (this connection must still be in the conection (recovery) state) */
-    tmp_err = sr_shmmod_oper_stored_del_conn(conn, conn->sr_cid);
+    /* free any stored operational data */
+    tmp_err = sr_shmmod_oper_stored_del_conn(conn, conn->cid);
     sr_errinfo_merge(&err_info, tmp_err);
-
-    if (real_mode == SR_LOCK_READ_UPGR) {
-        /* SHM LOCK UPGRADE */
-        if ((tmp_err = sr_shmmain_relock(conn, SR_LOCK_WRITE, __func__))) {
-            sr_errinfo_merge(&err_info, tmp_err);
-        } else {
-            real_mode = SR_LOCK_WRITE;
-        }
-    }
-
-    /* remove from state */
-    sr_shmmain_conn_del(conn, conn->sr_cid);
 
     if (real_mode) {
         /* SHM UNLOCK */
         sr_shmmain_unlock(conn, real_mode, 1, __func__);
     }
+
+    /* stop tracking this connection */
+    tmp_err = sr_shmmain_conn_list_del(conn->cid);
+    sr_errinfo_merge(&err_info, tmp_err);
 
     /* free attributes */
     sr_conn_free(conn);
@@ -443,74 +412,14 @@ API int
 sr_connection_count(uint32_t *conn_count)
 {
     sr_error_info_t *err_info = NULL;
-    sr_main_shm_t *main_shm;
-    sr_shm_t shm = SR_SHM_INITIALIZER, ext_shm = SR_SHM_INITIALIZER;
-    int shm_lock = -1;
-    uint32_t idx, count;
-    sr_conn_shm_t *conn_s;
 
     SR_CHECK_ARG_APIRET(!conn_count, NULL, err_info);
 
-    /* check that all required directories exist */
-    if ((err_info = sr_shmmain_check_dirs())) {
-        goto cleanup;
+    if ((err_info = sr_conn_info(NULL, NULL, conn_count))) {
+        return sr_api_ret(NULL, err_info);
     }
 
-    if ((err_info = sr_shmmain_createlock_open(&shm_lock))) {
-        goto cleanup;
-    }
-
-    /* CREATE LOCK */
-    if ((err_info = sr_shmmain_createlock(shm_lock))) {
-        goto cleanup;
-    }
-
-    /* open the main SHM */
-    err_info = sr_shmmain_main_open(&shm, NULL);
-    if (!err_info && (shm.fd > -1)) {
-        err_info = sr_shmmain_ext_open(&ext_shm, 0);
-    }
-
-    /* CREATE UNLOCK */
-    sr_shmmain_createunlock(shm_lock);
-
-    if (err_info) {
-        goto cleanup;
-    }
-    if (shm.fd == -1) {
-        /* main SHM does not even exist yet */
-        *conn_count = 0;
-        goto cleanup;
-    }
-
-    main_shm = (sr_main_shm_t *)shm.addr;
-
-    /* SHM LOCK */
-    if ((err_info = sr_rwlock(&main_shm->lock, SR_MAIN_LOCK_TIMEOUT * 1000, SR_LOCK_READ, __func__, NULL))) {
-        goto cleanup;
-    }
-
-    count = 0;
-    conn_s = (sr_conn_shm_t *)(ext_shm.addr + main_shm->conns);
-    for (idx = 0; idx < main_shm->conn_count; ++idx) {
-        if (sr_connection_exists(conn_s[idx].cid)) {
-            count++;
-        }
-    }
-    *conn_count = count;
-
-    /* SHM UNLOCK */
-    sr_rwunlock(&main_shm->lock, SR_LOCK_READ, __func__);
-
-    /* success */
-
-cleanup:
-    if (shm_lock > -1) {
-        close(shm_lock);
-    }
-    sr_shm_clear(&shm);
-    sr_shm_clear(&ext_shm);
-    return sr_api_ret(NULL, err_info);
+    return sr_api_ret(NULL, NULL);
 }
 
 API const struct ly_ctx *
@@ -606,18 +515,30 @@ static sr_error_info_t *
 sr_session_notif_buf_stop(sr_session_ctx_t *session)
 {
     sr_error_info_t *err_info = NULL;
+    struct timespec timeout_ts;
     int ret;
 
     if (!session->notif_buf.tid) {
         return NULL;
     }
 
-    /* signal the thread */
+    /* signal the thread to terminate */
     ATOMIC_STORE_RELAXED(session->notif_buf.thread_running, 0);
 
-    /* wake up the thread (by fake unlocking a read lock) */
-    ++session->notif_buf.lock.readers;
-    sr_rwunlock(&session->notif_buf.lock, SR_LOCK_READ, __func__);
+    /* wake up the thread */
+    sr_time_get(&timeout_ts, SR_NOTIF_BUF_LOCK_TIMEOUT);
+
+    /* MUTEX LOCK */
+    ret = pthread_mutex_timedlock(&session->notif_buf.lock.mutex, &timeout_ts);
+    if (ret) {
+        SR_ERRINFO_LOCK(&err_info, __func__, ret);
+        return err_info;
+    }
+
+    pthread_cond_broadcast(&session->notif_buf.lock.cond);
+
+    /* MUTEX UNLOCK */
+    pthread_mutex_unlock(&session->notif_buf.lock.mutex);
 
     /* join the thread, it will make sure all the buffered notifications are stored */
     ret = pthread_join(session->notif_buf.tid, NULL);
@@ -1142,7 +1063,7 @@ sr_install_module_data(sr_conn_ctx_t *conn, const char *module_name, const char 
     }
 
     /* fill it with current modules */
-    if ((err_info = sr_conn_lydmods_ctx_update(&tmp_ly_ctx, conn->main_shm.addr, 0, 0, &sr_mods, NULL))) {
+    if ((err_info = sr_conn_lydmods_ctx_update(&tmp_ly_ctx, 0, 0, &sr_mods, NULL))) {
         goto cleanup_unlock;
     }
 
@@ -2236,12 +2157,11 @@ cleanup_shm_unlock:
  * @param[in] mod_info Read-locked mod info with diff and data.
  * @param[in] session Originator session.
  * @param[in] timeout_ms Timeout in milliseconds.
- * @param[in] wait Whether to wait for DONE/ABORT events as well.
  * @param[out] cb_err_info Callback error information generated by a subscriber, if any.
  * @return err_info, NULL on success.
  */
 static sr_error_info_t *
-sr_changes_notify_store(struct sr_mod_info_s *mod_info, sr_session_ctx_t *session, uint32_t timeout_ms, int wait,
+sr_changes_notify_store(struct sr_mod_info_s *mod_info, sr_session_ctx_t *session, uint32_t timeout_ms,
         sr_error_info_t **cb_err_info)
 {
     sr_error_info_t *err_info = NULL;
@@ -2327,7 +2247,7 @@ sr_changes_notify_store(struct sr_mod_info_s *mod_info, sr_session_ctx_t *sessio
     }
     if (*cb_err_info) {
         /* "update" event failed, just clear the sub SHM and finish */
-        err_info = sr_shmsub_change_notify_clear(mod_info, SR_SUB_EV_UPDATE);
+        err_info = sr_shmsub_change_notify_clear(mod_info);
         goto cleanup;
     }
 
@@ -2393,7 +2313,7 @@ sr_changes_notify_store(struct sr_mod_info_s *mod_info, sr_session_ctx_t *sessio
     }
     if (*cb_err_info) {
         /* "change" event failed, publish "abort" event and finish */
-        err_info = sr_shmsub_change_notify_change_abort(mod_info, session->sid, wait ? timeout_ms : 0);
+        err_info = sr_shmsub_change_notify_change_abort(mod_info, session->sid, timeout_ms);
         goto cleanup;
     }
 
@@ -2413,7 +2333,7 @@ sr_changes_notify_store(struct sr_mod_info_s *mod_info, sr_session_ctx_t *sessio
     }
 
     /* publish "done" event, all changes were applied */
-    if ((err_info = sr_shmsub_change_notify_change_done(mod_info, session->sid, wait ? timeout_ms : 0))) {
+    if ((err_info = sr_shmsub_change_notify_change_done(mod_info, session->sid, timeout_ms))) {
         goto cleanup;
     }
 
@@ -2434,7 +2354,7 @@ cleanup:
 }
 
 API int
-sr_apply_changes(sr_session_ctx_t *session, uint32_t timeout_ms, int wait)
+sr_apply_changes(sr_session_ctx_t *session, uint32_t timeout_ms)
 {
     sr_error_info_t *err_info = NULL, *cb_err_info = NULL;
     struct sr_mod_info_s mod_info;
@@ -2482,7 +2402,7 @@ sr_apply_changes(sr_session_ctx_t *session, uint32_t timeout_ms, int wait)
     }
 
     /* notify all the subscribers and store the changes */
-    err_info = sr_changes_notify_store(&mod_info, session, timeout_ms, wait, &cb_err_info);
+    err_info = sr_changes_notify_store(&mod_info, session, timeout_ms, &cb_err_info);
 
 cleanup_mods_unlock:
     /* MODULES UNLOCK */
@@ -2541,12 +2461,11 @@ sr_discard_changes(sr_session_ctx_t *session)
  * @param[in] ly_mod Optional specific module.
  * @param[in] src_config Source data for the replace, they are spent.
  * @param[in] timeout_ms Change callback timeout in milliseconds.
- * @param[in] wait Whether to wait for DONE/ABORT events as well.
  * @return err_info, NULL on success.
  */
 static sr_error_info_t *
 _sr_replace_config(sr_session_ctx_t *session, const struct lys_module *ly_mod, struct lyd_node **src_config,
-        uint32_t timeout_ms, int wait)
+        uint32_t timeout_ms)
 {
     sr_error_info_t *err_info = NULL, *cb_err_info = NULL;
     struct ly_set mod_set = {0};
@@ -2573,7 +2492,7 @@ _sr_replace_config(sr_session_ctx_t *session, const struct lys_module *ly_mod, s
     }
 
     /* notify all the subscribers and store the changes */
-    err_info = sr_changes_notify_store(&mod_info, session, timeout_ms, wait, &cb_err_info);
+    err_info = sr_changes_notify_store(&mod_info, session, timeout_ms, &cb_err_info);
 
 cleanup_mods_unlock:
     /* MODULES UNLOCK */
@@ -2590,8 +2509,7 @@ cleanup_mods_unlock:
 }
 
 API int
-sr_replace_config(sr_session_ctx_t *session, const char *module_name, struct lyd_node *src_config, uint32_t timeout_ms,
-        int wait)
+sr_replace_config(sr_session_ctx_t *session, const char *module_name, struct lyd_node *src_config, uint32_t timeout_ms)
 {
     sr_error_info_t *err_info = NULL;
     const struct lys_module *ly_mod = NULL;
@@ -2624,7 +2542,7 @@ sr_replace_config(sr_session_ctx_t *session, const char *module_name, struct lyd
     }
 
     /* replace the data */
-    if ((err_info = _sr_replace_config(session, ly_mod, &src_config, timeout_ms, wait))) {
+    if ((err_info = _sr_replace_config(session, ly_mod, &src_config, timeout_ms))) {
         goto cleanup_shm_unlock;
     }
 
@@ -2639,8 +2557,7 @@ cleanup_shm_unlock:
 }
 
 API int
-sr_copy_config(sr_session_ctx_t *session, const char *module_name, sr_datastore_t src_datastore, uint32_t timeout_ms,
-        int wait)
+sr_copy_config(sr_session_ctx_t *session, const char *module_name, sr_datastore_t src_datastore, uint32_t timeout_ms)
 {
     sr_error_info_t *err_info = NULL;
     struct sr_mod_info_s mod_info;
@@ -2701,7 +2618,7 @@ sr_copy_config(sr_session_ctx_t *session, const char *module_name, sr_datastore_
     sr_shmmod_modinfo_unlock(&mod_info, session->sid);
 
     /* replace the data */
-    if ((err_info = _sr_replace_config(session, ly_mod, &mod_info.data, timeout_ms, wait))) {
+    if ((err_info = _sr_replace_config(session, ly_mod, &mod_info.data, timeout_ms))) {
         goto cleanup_shm_unlock;
     }
 
@@ -3157,6 +3074,14 @@ _sr_unsubscribe(sr_subscription_ctx_t *subscription)
 
     assert(subscription);
 
+    /* delete all subscriptions (also removes this subscription from all the sessions) */
+    if ((tmp_err = sr_subs_del_all(subscription))) {
+        /* continue */
+        sr_errinfo_merge(&err_info, tmp_err);
+    }
+
+    /* no new events can be generated at this point */
+
     if (ATOMIC_LOAD_RELAXED(subscription->thread_running)) {
         /* signal the thread to quit */
         ATOMIC_STORE_RELAXED(subscription->thread_running, 0);
@@ -3172,15 +3097,6 @@ _sr_unsubscribe(sr_subscription_ctx_t *subscription)
             }
         }
     }
-
-    /* delete all subscriptions (also removes this subscription from all the sessions) */
-    if ((tmp_err = sr_subs_del_all(subscription))) {
-        /* continue */
-        sr_errinfo_merge(&err_info, tmp_err);
-    }
-
-    /* remove subscription from main SHM state */
-    sr_shmmain_conn_del_evpipe(subscription->conn, subscription->evpipe_num);
 
     /* unlink event pipe */
     if ((tmp_err = sr_path_evpipe(subscription->evpipe_num, &path))) {
@@ -3335,7 +3251,6 @@ error_mods_unlock:
 
 /**
  * @brief Allocate and start listening on a new subscription.
- * Main SHM read-upgr lock must be held and will be temporarily upgraded!
  *
  * @param[in] conn Connection to use.
  * @param[in] opts Subscription options.
@@ -3388,11 +3303,6 @@ sr_subs_new(sr_conn_ctx_t *conn, sr_subscr_options_t opts, sr_subscription_ctx_t
     (*subs_p)->evpipe = SR_OPEN(path, O_RDWR | O_NONBLOCK, 0);
     if ((*subs_p)->evpipe == -1) {
         SR_ERRINFO_SYSERRNO(&err_info, "open");
-        goto error;
-    }
-
-    /* add the new subscription into main SHM */
-    if ((err_info = sr_shmmain_conn_add_evpipe(conn, (*subs_p)->evpipe_num))) {
         goto error;
     }
 
@@ -4384,7 +4294,7 @@ sr_rpc_send_tree(sr_session_ctx_t *session, struct lyd_node *input, uint32_t tim
 
     if (cb_err_info) {
         /* "rpc" event failed, publish "abort" event and finish */
-        err_info = sr_shmsub_rpc_notify_abort(session->conn, op_path, input, session->sid, event_id);
+        err_info = sr_shmsub_rpc_notify_abort(session->conn, op_path, input, session->sid, timeout_ms, event_id);
         goto cleanup_shm_unlock;
     }
 
@@ -4769,7 +4679,8 @@ sr_event_notif_send_tree(sr_session_ctx_t *session, struct lyd_node *notif)
 
     if (notif_sub_count) {
         /* publish notif in an event, do not wait for subscribers */
-        if ((tmp_err_info = sr_shmsub_notif_notify(notif, notif_ts, session->sid, notif_subs, notif_sub_count))) {
+        if ((tmp_err_info = sr_shmsub_notif_notify(notif, notif_ts, session->sid, session->conn->cid, notif_subs,
+                notif_sub_count))) {
             goto cleanup_shm_unlock;
         }
     } else {
